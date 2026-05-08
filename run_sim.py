@@ -24,6 +24,10 @@ def main():
                     help="Run as fast as possible (no wall-clock pacing)")
     ap.add_argument("--telem-hz", type=float, default=50.0,
                     help="Telemetry transmit rate")
+    ap.add_argument("--cmd-host", default="0.0.0.0",
+                    help="UDP bind host for inbound GCS commands")
+    ap.add_argument("--cmd-port", type=int, default=14551,
+                    help="UDP bind port for inbound GCS commands")
     args = ap.parse_args()
 
     home, wps = load_waypoints(args.waypoints)
@@ -33,9 +37,12 @@ def main():
         duration_s=args.duration,
         realtime=not args.no_realtime,
         telem_rate_hz=args.telem_hz,
+        cmd_host=args.cmd_host,
+        cmd_port=args.cmd_port,
     )
     sim = Simulator(home=home, waypoints_geo=wps, config=cfg)
     print(f"Sending UDP telemetry to {args.host}:{args.port}")
+    print(f"Listening for GCS commands on {args.cmd_host}:{args.cmd_port}")
     print(f"Home: {home.lat:.6f}, {home.lon:.6f}  ({len(wps)} waypoints)")
     try:
         sim.run()

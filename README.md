@@ -19,8 +19,15 @@ position on a map and its attitude in 3D.
   waypoint.
 - **Live GCS UI** — single matplotlib window with:
   - 2D map view showing planned waypoints and the live lat/lon breadcrumb,
-  - 3D attitude indicator showing body axes and a rotor cross,
-  - textual telemetry bar (time, lat/lon/alt, speed, roll/pitch/yaw, target WP).
+  - 3D attitude view rendered as a quadcopter (arms + filled rotor disks +
+    body box + heading arrow; front rotors red, rear rotors blue),
+  - textual telemetry bar (time, lat/lon/alt, speed, roll/pitch/yaw, target WP),
+  - **Reset mission** button — replays the current mission from waypoint 0,
+  - **Load waypoints.json** button — file picker to upload a new mission to
+    the simulator at runtime.
+- **GCS → Simulator command channel** — JSON over UDP (default port 14551)
+  carrying ``reset`` and ``load_mission`` commands; see
+  ``quad_sim/commands.py``.
 
 ## Repository Layout
 
@@ -32,7 +39,8 @@ quad_6dof_model/
 │   ├── controller.py        # Cascaded PID autopilot
 │   ├── waypoints.py         # Waypoint loader + manager
 │   ├── telemetry.py         # UDP JSON sender/receiver + TelemetryPacket
-│   └── simulator.py         # Main simulation loop
+│   ├── commands.py          # GCS->Sim command protocol (reset, load_mission)
+│   └── simulator.py         # Main simulation loop (with command listener)
 ├── gcs/
 │   └── gcs_app.py           # UDP receiver + matplotlib map / attitude UI
 ├── run_sim.py               # Simulator entry point
@@ -78,8 +86,10 @@ You typically run the GCS first (so it is listening) and then the simulator.
 ```bash
 python run_gcs.py
 # Optional flags:
-#   --host 0.0.0.0           # UDP bind host (default 0.0.0.0)
-#   --port 14550             # UDP bind port (default 14550)
+#   --host 0.0.0.0           # UDP bind host for telemetry (default 0.0.0.0)
+#   --port 14550             # UDP bind port for telemetry (default 14550)
+#   --cmd-host 127.0.0.1     # destination host for outbound commands
+#   --cmd-port 14551         # destination port for outbound commands
 #   --waypoints waypoints.json   # overlay planned waypoints on the map
 ```
 
@@ -88,9 +98,11 @@ python run_gcs.py
 ```bash
 python run_sim.py
 # Optional flags:
-#   --waypoints waypoints.json   # mission file (default waypoints.json)
-#   --host 127.0.0.1             # UDP destination host
-#   --port 14550                 # UDP destination port
+#   --waypoints waypoints.json   # initial mission file (default waypoints.json)
+#   --host 127.0.0.1             # UDP destination host (telemetry)
+#   --port 14550                 # UDP destination port (telemetry)
+#   --cmd-host 0.0.0.0           # UDP bind host for inbound GCS commands
+#   --cmd-port 14551             # UDP bind port for inbound GCS commands
 #   --duration 60                # stop after N seconds of sim time
 #   --no-realtime                # run as fast as possible (no wall-clock pacing)
 #   --telem-hz 50                # telemetry transmit rate
@@ -99,6 +111,17 @@ python run_sim.py
 The default mission climbs to 30 m, flies a square at 30/50 m altitude, and
 returns to a 5 m hover. The full pattern completes in roughly 42 seconds of
 simulated time.
+
+### GCS controls
+
+- **Reset mission** — sends a ``reset`` command to the simulator. The vehicle
+  is returned to (0, 0, 0) at the home point with zero velocity / attitude,
+  the controller integrators are zeroed, and the current waypoint plan is
+  replayed from waypoint 0. The local map trail is cleared.
+- **Load waypoints.json** — opens a file picker (tkinter); the selected file
+  is parsed and a ``load_mission`` command is sent to the simulator. If the
+  file specifies a ``home``, the simulator's local NED origin is moved to it.
+  The map overlay is refreshed and the trail cleared.
 
 ## Mission File Format
 
@@ -140,6 +163,32 @@ Each packet is a UTF-8 encoded JSON object:
 Any client that can read UDP and parse JSON can consume the stream — see
 `quad_sim/telemetry.py` (`TelemetryPacket`, `UDPTelemetryReceiver`) for the
 reference Python decoder.
+
+## GCS → Simulator Command Format
+
+Commands are JSON UDP packets (default destination port 14551). Two types are
+supported:
+
+```json
+{"type": "reset"}
+```
+
+```json
+{
+  "type": "load_mission",
+  "home": {"lat": 47.6062, "lon": -122.3321, "alt": 0.0},
+  "waypoints": [
+    {"lat": 47.6062, "lon": -122.3321, "alt": 20.0},
+    {"lat": 47.6068, "lon": -122.3321, "alt": 20.0}
+  ]
+}
+```
+
+The ``home`` field is optional in ``load_mission``; if omitted, the existing
+NED origin is preserved and only the waypoint list is swapped. Both commands
+reset the vehicle state, the controller integrators, and sim time. See
+``quad_sim/commands.py`` for the reference ``CommandSender`` /
+``CommandReceiver`` helpers.
 
 ## Coordinate Conventions
 
