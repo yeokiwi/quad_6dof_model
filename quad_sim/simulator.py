@@ -1,15 +1,23 @@
 """Top-level simulation loop wiring dynamics, controller, waypoints and telemetry.
 
-A separate UDP command listener thread accepts ``reset`` and ``load_mission``
-messages from the GCS at runtime; commands are drained between physics steps
-in the main loop, so updates are atomic with respect to integration.
+A separate UDP command listener thread accepts ``reset``, ``load_mission`` and
+``save_trajectory`` messages from the GCS at runtime; commands are drained
+between physics steps in the main loop, so updates are atomic with respect to
+integration.
+
+In addition to telemetry, every 10 ms of sim time the simulator appends a row
+to an in-memory trajectory buffer. The ``save_trajectory`` command writes the
+buffer to a CSV file (in a worker thread so the physics loop is not stalled).
 """
 from __future__ import annotations
 
+import csv
+import datetime as _dt
 import queue
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -19,6 +27,16 @@ from .coordinates import GeodeticNEDConverter, GeoPoint
 from .dynamics import QuadDynamics, QuadParams, QuadState
 from .telemetry import TelemetryPacket, UDPTelemetrySender
 from .waypoints import WaypointManager
+
+TRAJECTORY_PERIOD_S = 0.010
+_CSV_HEADER = [
+    "t", "lat", "lon", "alt",
+    "north", "east", "down",
+    "vn", "ve", "vd",
+    "roll_rad", "pitch_rad", "yaw_rad",
+    "p", "q", "r",
+    "thrust", "wp_index",
+]
 
 
 @dataclass
@@ -61,6 +79,12 @@ class Simulator:
         self._cmd_rx: CommandReceiver | None = None
         if self.cfg.cmd_enabled:
             self._start_command_listener()
+
+        # Trajectory log (10 ms cadence). Guarded by a lock because a worker
+        # thread may snapshot it during a save while the main loop appends.
+        self._traj_log: list[list] = []
+        self._traj_lock = threading.Lock()
+        self._next_traj_t = 0.0
 
     # ----- Command listener -----
     def _start_command_listener(self) -> None:
@@ -112,6 +136,8 @@ class Simulator:
                                        accept_radius=self.cfg.accept_radius)
             self._reset_vehicle()
             print(f"[sim] new mission loaded ({len(wps)} waypoints)")
+        elif typ == "save_trajectory":
+            self._spawn_save_trajectory(msg.get("path"))
         else:
             raise ValueError(f"unknown command type: {typ!r}")
 
@@ -127,7 +153,47 @@ class Simulator:
         self.controller.reset()
         self.t = 0.0
         self._next_telem_t = 0.0
+        self._next_traj_t = 0.0
         self._wall_start = time.perf_counter()
+        with self._traj_lock:
+            self._traj_log.clear()
+
+    # ----- Trajectory log -----
+    def _record_trajectory(self, u: np.ndarray) -> None:
+        n, e, d = self.state.pos
+        geo = self.converter.ned_to_geo(float(n), float(e), float(d))
+        row = [
+            self.t,
+            geo.lat, geo.lon, geo.alt,
+            float(n), float(e), float(d),
+            float(self.state.vel[0]), float(self.state.vel[1]), float(self.state.vel[2]),
+            float(self.state.euler[0]), float(self.state.euler[1]), float(self.state.euler[2]),
+            float(self.state.omega[0]), float(self.state.omega[1]), float(self.state.omega[2]),
+            float(u[0]),
+            self.wpm.index,
+        ]
+        with self._traj_lock:
+            self._traj_log.append(row)
+
+    def _spawn_save_trajectory(self, path: str | None) -> None:
+        if not path:
+            ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = f"trajectory_{ts}.csv"
+        with self._traj_lock:
+            snapshot = list(self._traj_log)
+        n_rows = len(snapshot)
+
+        def write():
+            try:
+                with open(path, "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(_CSV_HEADER)
+                    w.writerows(snapshot)
+                print(f"[sim] saved {n_rows} trajectory rows to {Path(path).resolve()}")
+            except OSError as e:
+                print(f"[sim] failed to save trajectory: {e}")
+
+        threading.Thread(target=write, daemon=True).start()
 
     # ----- Telemetry packing -----
     def _build_packet(self, u: np.ndarray) -> TelemetryPacket:
@@ -159,6 +225,7 @@ class Simulator:
         dt = self.cfg.dt
         telem_period = 1.0 / self.cfg.telem_rate_hz
         self._next_telem_t = 0.0
+        self._next_traj_t = 0.0
         self._wall_start = time.perf_counter()
         last_u = np.zeros(4)
         try:
@@ -170,6 +237,12 @@ class Simulator:
                 self.state = self.dynamics.step(self.state, u, dt)
                 self.t += dt
                 last_u = u
+
+                if self.t >= self._next_traj_t:
+                    self._record_trajectory(u)
+                    self._next_traj_t += TRAJECTORY_PERIOD_S
+                    if self._next_traj_t <= self.t:
+                        self._next_traj_t = self.t + TRAJECTORY_PERIOD_S
 
                 if self.t >= self._next_telem_t:
                     self.sender.send(self._build_packet(u))

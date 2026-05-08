@@ -18,16 +18,26 @@ position on a map and its attitude in 3D.
   carrying position, velocity, attitude, body rates, thrust, and current
   waypoint.
 - **Live GCS UI** — single matplotlib window with:
-  - 2D map view showing planned waypoints and the live lat/lon breadcrumb,
+  - 2D map view showing planned waypoints and the live lat/lon breadcrumb;
+    the view auto-scales to comfortably fit all waypoints + trail + vehicle,
   - 3D attitude view rendered as a quadcopter (arms + filled rotor disks +
     body box + heading arrow; front rotors red, rear rotors blue),
   - textual telemetry bar (time, lat/lon/alt, speed, roll/pitch/yaw, target WP),
   - **Reset mission** button — replays the current mission from waypoint 0,
   - **Load waypoints.json** button — file picker to upload a new mission to
-    the simulator at runtime.
+    the simulator at runtime,
+  - **Save trajectory CSV** button — writes the simulator's 10 ms-cadence
+    trajectory buffer to a CSV file.
 - **GCS → Simulator command channel** — JSON over UDP (default port 14551)
-  carrying ``reset`` and ``load_mission`` commands; see
+  carrying ``reset``, ``load_mission`` and ``save_trajectory`` commands; see
   ``quad_sim/commands.py``.
+- **Configurable vehicle limits** — ``drone.json`` lets the user set the
+  maximum speed, climb rate, and per-axis (roll/pitch/yaw) angular rate
+  limits, plus mass / thrust / inertia / drag if needed. Loaded automatically
+  by ``run_sim.py`` when present.
+- **High-rate trajectory log** — every 10 ms the simulator appends the full
+  vehicle state to an in-memory buffer. The GCS save button (or any client
+  sending ``{"type":"save_trajectory"}``) writes the buffer to CSV.
 
 ## Repository Layout
 
@@ -39,13 +49,15 @@ quad_6dof_model/
 │   ├── controller.py        # Cascaded PID autopilot
 │   ├── waypoints.py         # Waypoint loader + manager
 │   ├── telemetry.py         # UDP JSON sender/receiver + TelemetryPacket
-│   ├── commands.py          # GCS->Sim command protocol (reset, load_mission)
-│   └── simulator.py         # Main simulation loop (with command listener)
+│   ├── commands.py          # GCS->Sim command protocol
+│   ├── drone_config.py      # drone.json loader + apply to params/gains
+│   └── simulator.py         # Main simulation loop + 10 ms trajectory log
 ├── gcs/
 │   └── gcs_app.py           # UDP receiver + matplotlib map / attitude UI
 ├── run_sim.py               # Simulator entry point
 ├── run_gcs.py               # GCS entry point
 ├── waypoints.json           # Example mission (climb -> square -> land)
+├── drone.json               # Example vehicle / autopilot limits
 ├── requirements.txt
 └── README.md
 ```
@@ -99,6 +111,8 @@ python run_gcs.py
 python run_sim.py
 # Optional flags:
 #   --waypoints waypoints.json   # initial mission file (default waypoints.json)
+#   --drone drone.json           # vehicle / autopilot limits (default drone.json;
+#                                # silently skipped if the file does not exist)
 #   --host 127.0.0.1             # UDP destination host (telemetry)
 #   --port 14550                 # UDP destination port (telemetry)
 #   --cmd-host 0.0.0.0           # UDP bind host for inbound GCS commands
@@ -121,7 +135,13 @@ simulated time.
 - **Load waypoints.json** — opens a file picker (tkinter); the selected file
   is parsed and a ``load_mission`` command is sent to the simulator. If the
   file specifies a ``home``, the simulator's local NED origin is moved to it.
-  The map overlay is refreshed and the trail cleared.
+  The map overlay is refreshed, the trail cleared, and the map auto-rescaled
+  to fit the new mission.
+- **Save trajectory CSV** — opens a Save-As dialog and sends a
+  ``save_trajectory`` command to the simulator. The simulator writes the
+  full 10 ms-cadence buffer to that path on its host. If the dialog is
+  cancelled, the simulator picks a default ``trajectory_<timestamp>.csv``
+  filename in its current working directory.
 
 ## Mission File Format
 
@@ -164,10 +184,57 @@ Any client that can read UDP and parse JSON can consume the stream — see
 `quad_sim/telemetry.py` (`TelemetryPacket`, `UDPTelemetryReceiver`) for the
 reference Python decoder.
 
+## Drone Configuration (`drone.json`)
+
+`drone.json` exposes the most commonly tuned vehicle / autopilot limits
+without editing source. Every field is optional — anything omitted keeps its
+built-in default:
+
+```json
+{
+  "max_speed":          8.0,    // max horizontal speed [m/s]
+  "max_climb_rate":     3.0,    // max vertical speed   [m/s]
+  "max_roll_rate_deg":  180.0,  // body roll rate limit  [deg/s]
+  "max_pitch_rate_deg": 180.0,  // body pitch rate limit [deg/s]
+  "max_yaw_rate_deg":   120.0,  // body yaw rate limit   [deg/s]
+  "max_tilt_deg":       30.0,   // commanded tilt limit  [deg]
+  "mass_kg":            1.2,
+  "max_thrust_n":       39.24,
+  "drag_lin":           0.10,
+  "inertia": {"Ixx": 0.012, "Iyy": 0.012, "Izz": 0.022}
+}
+```
+
+`run_sim.py` looks for `drone.json` in the working directory by default; pass
+`--drone path/to/file.json` to use a different file. The schema is documented
+in `quad_sim/drone_config.py`.
+
+## Trajectory CSV Log
+
+The simulator records the full vehicle state every 10 ms (independent of the
+UDP telemetry rate) into an in-memory buffer. The buffer is cleared on
+`reset` / `load_mission`. When asked to save, the simulator writes a CSV with
+this header:
+
+```
+t,lat,lon,alt,north,east,down,vn,ve,vd,roll_rad,pitch_rad,yaw_rad,p,q,r,thrust,wp_index
+```
+
+Triggering a save:
+
+- **From the GCS** — click *Save trajectory CSV*; pick a path (or cancel to
+  let the simulator default to `trajectory_<timestamp>.csv` in its CWD).
+- **Programmatically** — send `{"type":"save_trajectory","path":"out.csv"}`
+  to the simulator's command port. The CSV is written from a worker thread,
+  so the physics loop is not stalled even for large buffers.
+
+The saved file lives on the simulator host (typically the same machine as
+the GCS during local development).
+
 ## GCS → Simulator Command Format
 
-Commands are JSON UDP packets (default destination port 14551). Two types are
-supported:
+Commands are JSON UDP packets (default destination port 14551). Three types
+are supported:
 
 ```json
 {"type": "reset"}
@@ -184,11 +251,17 @@ supported:
 }
 ```
 
+```json
+{"type": "save_trajectory", "path": "/tmp/run1.csv"}
+```
+
 The ``home`` field is optional in ``load_mission``; if omitted, the existing
-NED origin is preserved and only the waypoint list is swapped. Both commands
-reset the vehicle state, the controller integrators, and sim time. See
-``quad_sim/commands.py`` for the reference ``CommandSender`` /
-``CommandReceiver`` helpers.
+NED origin is preserved and only the waypoint list is swapped. ``reset`` and
+``load_mission`` both reset the vehicle state, the controller integrators,
+sim time, and the trajectory buffer. ``save_trajectory.path`` is optional;
+if omitted, the simulator picks a timestamped filename in its current
+working directory. See ``quad_sim/commands.py`` for the reference
+``CommandSender`` / ``CommandReceiver`` helpers.
 
 ## Coordinate Conventions
 

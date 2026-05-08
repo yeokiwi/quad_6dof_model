@@ -146,7 +146,8 @@ class GCSApp:
         self.ax_text.axis("off")
         self.ax_btn_reset = self.fig.add_subplot(gs[2, 0])
         self.ax_btn_load = self.fig.add_subplot(gs[2, 1])
-        # Leave gs[2, 2:] empty for spacing.
+        self.ax_btn_save = self.fig.add_subplot(gs[2, 2])
+        # Leave gs[2, 3] empty for spacing.
 
         self._planned_line = None
         self._planned_labels: list = []
@@ -162,8 +163,10 @@ class GCSApp:
 
         self.btn_reset = Button(self.ax_btn_reset, "Reset mission")
         self.btn_load = Button(self.ax_btn_load, "Load waypoints.json")
+        self.btn_save = Button(self.ax_btn_save, "Save trajectory CSV")
         self.btn_reset.on_clicked(self._on_reset)
         self.btn_load.on_clicked(self._on_load)
+        self.btn_save.on_clicked(self._on_save_trajectory)
 
     # ----- Map setup -----
     def _setup_map(self):
@@ -179,7 +182,36 @@ class GCSApp:
                                       markersize=10, label="Vehicle")
         ax.set_aspect("equal", adjustable="datalim")
         self._draw_planned_overlay()
+        self._autoscale_map()
         ax.legend(loc="upper right", fontsize=8)
+
+    def _autoscale_map(self):
+        """Set map limits to fit all waypoints + the live trail + vehicle.
+
+        Padded by 10% of the longest span so points sit comfortably inside
+        the axes rather than on the edge. The lat/lon spans are equalized to
+        avoid one axis becoming pencil-thin when the mission is mostly
+        north-south or east-west.
+        """
+        lats: list[float] = list(self.wp_lat)
+        lons: list[float] = list(self.wp_lon)
+        with self.shared.lock:
+            lats.extend(self.shared.trail_lat)
+            lons.extend(self.shared.trail_lon)
+            if self.shared.latest is not None:
+                lats.append(self.shared.latest.lat)
+                lons.append(self.shared.latest.lon)
+        if not lats or not lons:
+            return
+        lat_min, lat_max = min(lats), max(lats)
+        lon_min, lon_max = min(lons), max(lons)
+        span = max(lat_max - lat_min, lon_max - lon_min, 1e-4)
+        margin = 0.10 * span
+        half = 0.5 * span + margin
+        lat_c = 0.5 * (lat_min + lat_max)
+        lon_c = 0.5 * (lon_min + lon_max)
+        self.ax_map.set_xlim(lon_c - half, lon_c + half)
+        self.ax_map.set_ylim(lat_c - half, lat_c + half)
 
     def _draw_planned_overlay(self):
         ax = self.ax_map
@@ -288,15 +320,7 @@ class GCSApp:
 
         self.trail_line.set_data(lons, lats)
         self.vehicle_dot.set_data([pkt.lon], [pkt.lat])
-        xlim = self.ax_map.get_xlim(); ylim = self.ax_map.get_ylim()
-        pad_x = max(0.0001, 0.05 * (xlim[1] - xlim[0]))
-        pad_y = max(0.0001, 0.05 * (ylim[1] - ylim[0]))
-        if pkt.lon < xlim[0] or pkt.lon > xlim[1]:
-            self.ax_map.set_xlim(min(xlim[0], pkt.lon - pad_x),
-                                 max(xlim[1], pkt.lon + pad_x))
-        if pkt.lat < ylim[0] or pkt.lat > ylim[1]:
-            self.ax_map.set_ylim(min(ylim[0], pkt.lat - pad_y),
-                                 max(ylim[1], pkt.lat + pad_y))
+        self._autoscale_map()
 
         self._draw_quad(pkt.roll, pkt.pitch, pkt.yaw)
 
@@ -358,8 +382,20 @@ class GCSApp:
         self.wp_lon = [w["lon"] for w in wps]
         self._draw_planned_overlay()
         self._clear_trail()
+        self._autoscale_map()
         self._flash(f"Loaded {len(wps)} waypoints from {Path(path).name}")
         print(f"[gcs] loaded mission '{path}' ({len(wps)} waypoints)")
+
+    def _on_save_trajectory(self, _event):
+        path = self._pick_save_path()
+        # Cancelled: empty path means "let the simulator pick a default"
+        self.commands.save_trajectory(path)
+        if path:
+            self._flash(f"Save requested: {Path(path).name}")
+            print(f"[gcs] save_trajectory sent (path={path})")
+        else:
+            self._flash("Save requested (sim will pick default filename)")
+            print("[gcs] save_trajectory sent (default path on sim host)")
 
     def _pick_file(self) -> str | None:
         try:
@@ -374,6 +410,25 @@ class GCSApp:
             path = filedialog.askopenfilename(
                 title="Select waypoints JSON",
                 filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            )
+        finally:
+            root.destroy()
+        return path or None
+
+    def _pick_save_path(self) -> str | None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError:
+            return None
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            path = filedialog.asksaveasfilename(
+                title="Save trajectory CSV (path is on the simulator host)",
+                defaultextension=".csv",
+                initialfile="trajectory.csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
             )
         finally:
             root.destroy()

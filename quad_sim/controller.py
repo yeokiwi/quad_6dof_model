@@ -41,11 +41,13 @@ class ControllerGains:
     kd_rate_yaw: float = 0.010
 
     # Limits
-    max_vel_xy: float = 8.0     # m/s
-    max_vel_z: float = 3.0      # m/s
-    max_accel_xy: float = 6.0   # m/s^2
+    max_vel_xy: float = 8.0           # m/s   (max horizontal speed)
+    max_vel_z: float = 3.0            # m/s   (max climb / descent rate)
+    max_accel_xy: float = 6.0         # m/s^2
     max_tilt: float = np.deg2rad(30.0)
-    max_rate: float = np.deg2rad(180.0)
+    max_roll_rate: float = np.deg2rad(180.0)
+    max_pitch_rate: float = np.deg2rad(180.0)
+    max_yaw_rate: float = np.deg2rad(180.0)
 
 
 class CascadedController:
@@ -123,7 +125,10 @@ class CascadedController:
             self.g.kp_att_rp  * att_err[1],
             self.g.kp_att_yaw * att_err[2],
         ])
-        omega_set = np.clip(omega_set, -self.g.max_rate, self.g.max_rate)
+        rate_limits = np.array([self.g.max_roll_rate,
+                                self.g.max_pitch_rate,
+                                self.g.max_yaw_rate])
+        omega_set = np.clip(omega_set, -rate_limits, rate_limits)
 
         # 5. Body rate -> torque
         omega_err = omega_set - state.omega

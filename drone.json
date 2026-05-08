@@ -1,0 +1,12 @@
+{
+  "max_speed":         8.0,
+  "max_climb_rate":    3.0,
+  "max_roll_rate_deg": 180.0,
+  "max_pitch_rate_deg":180.0,
+  "max_yaw_rate_deg":  120.0,
+  "max_tilt_deg":      30.0,
+  "mass_kg":           1.2,
+  "max_thrust_n":      39.24,
+  "drag_lin":          0.10,
+  "inertia": {"Ixx": 0.012, "Iyy": 0.012, "Izz": 0.022}
+}

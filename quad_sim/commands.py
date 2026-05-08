@@ -12,6 +12,12 @@ Messages are simple JSON objects with a ``type`` field. Two types are defined:
       Replace the active mission. If ``home`` is provided, the local NED
       origin is moved to it. The vehicle state is reset as for ``reset``.
 
+  {"type": "save_trajectory",
+   "path": "/abs/or/relative/path.csv"}            (optional)
+      Dump the 10 ms-cadence trajectory buffer to ``path`` (or a timestamped
+      filename in the simulator's working directory if omitted). The buffer
+      is preserved; the sim keeps recording afterwards.
+
 Packets are sent on a separate UDP port from telemetry to keep the two
 streams independent.
 """
@@ -40,6 +46,16 @@ class CommandSender:
         msg: dict[str, Any] = {"type": "load_mission", "waypoints": waypoints}
         if home is not None:
             msg["home"] = home
+        self.send(msg)
+
+    def save_trajectory(self, path: str | None = None) -> None:
+        """Tell the simulator to dump its 10 ms-cadence trajectory buffer to a
+        CSV file. If ``path`` is None the simulator picks a timestamped
+        filename in its current working directory.
+        """
+        msg: dict[str, Any] = {"type": "save_trajectory"}
+        if path:
+            msg["path"] = path
         self.send(msg)
 
     def close(self) -> None:
