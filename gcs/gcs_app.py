@@ -185,9 +185,11 @@ class GCSApp:
         self.ax_traj3d = self.fig.add_subplot(gs[0, 1], projection="3d")
         self.ax_att = self.fig.add_subplot(gs[0, 2], projection="3d")
 
-        side = gs[0, 3].subgridspec(2, 1, height_ratios=[1, 1.4], hspace=0.30)
-        self.ax_missions = self.fig.add_subplot(side[0])
-        self.ax_wplist = self.fig.add_subplot(side[1])
+        side = gs[0, 3].subgridspec(3, 1, height_ratios=[0.22, 1, 1.4],
+                                    hspace=0.40)
+        self.ax_btn_refresh = self.fig.add_subplot(side[0])
+        self.ax_missions = self.fig.add_subplot(side[1])
+        self.ax_wplist = self.fig.add_subplot(side[2])
 
         self.ax_text = self.fig.add_subplot(gs[1, :])
         self.ax_text.axis("off")
@@ -420,7 +422,20 @@ class GCSApp:
 
     # ----- Missions panel -----
     def _setup_missions_panel(self, initial_path: str | None):
+        self.mission_radio = None
+        self._active_mission_name = Path(initial_path).name if initial_path else ""
+        self.btn_refresh = Button(self.ax_btn_refresh, "Refresh list")
+        self.btn_refresh.label.set_fontsize(8)
+        self.btn_refresh.on_clicked(self._on_refresh_missions)
+        self._rebuild_mission_radio()
+
+    def _rebuild_mission_radio(self):
+        """(Re)create the mission RadioButtons from the current file scan,
+        preserving the active selection when the file still exists. The
+        RadioButtons constructor does not fire on_clicked, so rebuilding
+        never triggers a spurious mission upload."""
         ax = self.ax_missions
+        ax.clear()
         ax.set_title("Missions", fontsize=10)
         self.mission_radio = None
         if not self.mission_files:
@@ -431,15 +446,20 @@ class GCSApp:
             return
         labels = [p.name for p in self.mission_files]
         active = 0
-        if initial_path:
-            try:
-                active = labels.index(Path(initial_path).name)
-            except ValueError:
-                pass
+        if self._active_mission_name in labels:
+            active = labels.index(self._active_mission_name)
         self.mission_radio = RadioButtons(ax, labels, active=active)
         for lbl in self.mission_radio.labels:
             lbl.set_fontsize(8)
         self.mission_radio.on_clicked(self._on_mission_selected)
+
+    def _on_refresh_missions(self, _event):
+        self.mission_files = scan_mission_files(self.missions_dir)
+        self._rebuild_mission_radio()
+        self.fig.canvas.draw_idle()
+        self._flash(f"Mission list refreshed ({len(self.mission_files)} files)")
+        print(f"[gcs] mission list refreshed: "
+              f"{[p.name for p in self.mission_files]}")
 
     def _on_mission_selected(self, label: str):
         path = Path(self.missions_dir) / label
@@ -449,6 +469,7 @@ class GCSApp:
             self._flash(f"Load failed: {e}")
             print(f"[gcs] failed to load mission '{path}': {e}")
             return
+        self._active_mission_name = label
         self.commands.load_mission(home, wps)
         self._clear_trail()
         self._draw_planned_overlay()
@@ -634,7 +655,9 @@ class GCSApp:
 
 def main():
     ap = argparse.ArgumentParser(description="Quadcopter GCS (UDP receiver + display)")
-    ap.add_argument("--host", default="0.0.0.0", help="UDP bind host (telemetry)")
+    ap.add_argument("--host", default="239.0.0.1",
+                    help="Telemetry source: multicast group to join (default) "
+                         "or a local bind address for unicast")
     ap.add_argument("--port", type=int, default=14550, help="UDP bind port (telemetry)")
     ap.add_argument("--cmd-host", default="127.0.0.1",
                     help="UDP destination host for commands (sim address)")

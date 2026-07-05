@@ -15,6 +15,7 @@ from quad_sim.controller import ControllerGains
 from quad_sim.drone_config import apply_drone_config, load_drone_config
 from quad_sim.dynamics import QuadParams
 from quad_sim.simulator import SimConfig, Simulator
+from quad_sim.telemetry import is_multicast
 from quad_sim.waypoints import load_waypoints
 
 
@@ -24,8 +25,15 @@ def main():
                     help="Path to waypoints JSON file")
     ap.add_argument("--drone", default="drone.json",
                     help="Path to drone parameters JSON (optional)")
-    ap.add_argument("--host", default="127.0.0.1", help="UDP destination host")
+    ap.add_argument("--host", default="239.0.0.1",
+                    help="UDP telemetry destination: multicast group (default)"
+                         " or a unicast IP")
     ap.add_argument("--port", type=int, default=14550, help="UDP destination port")
+    ap.add_argument("--mcast-ttl", type=int, default=1,
+                    help="Multicast TTL (1 = local subnet)")
+    ap.add_argument("--no-autosave", action="store_true",
+                    help="Do not save the trajectory CSV automatically at "
+                         "mission completion / simulator exit")
     ap.add_argument("--duration", type=float, default=None,
                     help="Stop after N seconds of sim time (default: run forever)")
     ap.add_argument("--no-realtime", action="store_true",
@@ -61,10 +69,13 @@ def main():
         cmd_host=args.cmd_host,
         cmd_port=args.cmd_port,
         autostart=args.autostart,
+        autosave_trajectory=not args.no_autosave,
+        mcast_ttl=args.mcast_ttl,
     )
     sim = Simulator(home=home, waypoints_geo=wps, config=cfg,
                     quad_params=params, gains=gains)
-    print(f"Sending UDP telemetry to {args.host}:{args.port}")
+    mode = "multicast" if is_multicast(args.host) else "unicast"
+    print(f"Sending UDP telemetry to {args.host}:{args.port} ({mode})")
     print(f"Listening for GCS commands on {args.cmd_host}:{args.cmd_port}")
     print(f"Home: {home.lat:.6f}, {home.lon:.6f}  ({len(wps)} waypoints)")
     if not args.autostart:

@@ -59,6 +59,8 @@ class SimConfig:
     cmd_enabled: bool = True
     autostart: bool = False
     idle_telem_rate_hz: float = 5.0
+    autosave_trajectory: bool = True
+    mcast_ttl: int = 1
 
 
 class Simulator:
@@ -80,7 +82,10 @@ class Simulator:
         self._wall_start = 0.0
         self._next_telem_t = 0.0
         self.run_state = "running" if self.cfg.autostart else "waiting"
-        self.sender = UDPTelemetrySender(self.cfg.udp_host, self.cfg.udp_port)
+        self.sender = UDPTelemetrySender(self.cfg.udp_host, self.cfg.udp_port,
+                                         mcast_ttl=self.cfg.mcast_ttl)
+        self._mission_complete = False
+        self._rows_saved = 0  # rows already written by the latest save
 
         self._cmd_queue: queue.Queue = queue.Queue()
         self._cmd_stop = threading.Event()
@@ -168,6 +173,16 @@ class Simulator:
         else:
             raise ValueError(f"unknown command type: {typ!r}")
 
+    def _check_mission_complete(self) -> bool:
+        """True when the vehicle has settled at the final waypoint: last
+        waypoint active, inside the accept radius, and nearly stationary."""
+        if self.wpm.index < len(self.wpm.waypoints) - 1:
+            return False
+        target = self.wpm.current()
+        dist = float(np.linalg.norm(self.state.pos - target.ned))
+        speed = float(np.linalg.norm(self.state.vel))
+        return dist <= self.cfg.accept_radius and speed < 0.5
+
     def _resume_clock(self) -> None:
         """Re-anchor the wall clock so real-time pacing continues from the
         current sim time instead of trying to catch up the paused interval."""
@@ -187,6 +202,8 @@ class Simulator:
         self._next_telem_t = 0.0
         self._next_traj_t = 0.0
         self._wall_start = time.perf_counter()
+        self._mission_complete = False
+        self._rows_saved = 0
         with self._traj_lock:
             self._traj_log.clear()
 
@@ -207,13 +224,18 @@ class Simulator:
         with self._traj_lock:
             self._traj_log.append(row)
 
-    def _spawn_save_trajectory(self, path: str | None) -> None:
+    def _spawn_save_trajectory(self, path: str | None,
+                               blocking: bool = False) -> None:
         if not path:
             ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             path = f"trajectory_{ts}.csv"
         with self._traj_lock:
             snapshot = list(self._traj_log)
+        if not snapshot:
+            print("[sim] trajectory buffer empty; nothing to save")
+            return
         n_rows = len(snapshot)
+        self._rows_saved = n_rows
 
         def write():
             try:
@@ -225,7 +247,10 @@ class Simulator:
             except OSError as e:
                 print(f"[sim] failed to save trajectory: {e}")
 
-        threading.Thread(target=write, daemon=True).start()
+        if blocking:
+            write()
+        else:
+            threading.Thread(target=write, daemon=True).start()
 
     # ----- Telemetry packing -----
     def _build_packet(self, u: np.ndarray) -> TelemetryPacket:
@@ -283,6 +308,12 @@ class Simulator:
                 self.t += dt
                 last_u = u
 
+                if not self._mission_complete and self._check_mission_complete():
+                    self._mission_complete = True
+                    print(f"[sim] mission complete at t={self.t:.2f}s")
+                    if self.cfg.autosave_trajectory:
+                        self._spawn_save_trajectory(None)
+
                 if self.t >= self._next_traj_t:
                     self._record_trajectory(u)
                     self._next_traj_t += TRAJECTORY_PERIOD_S
@@ -308,6 +339,12 @@ class Simulator:
         finally:
             try:
                 self.sender.send(self._build_packet(last_u))
+                if self.cfg.autosave_trajectory:
+                    with self._traj_lock:
+                        unsaved = len(self._traj_log) - self._rows_saved
+                    if unsaved > 0:
+                        # Blocking: must finish before the process exits.
+                        self._spawn_save_trajectory(None, blocking=True)
             finally:
                 self.sender.close()
                 self._stop_command_listener()

@@ -14,9 +14,16 @@ position on a map and its attitude in 3D.
 - **Autonomous flight** — cascaded position → velocity → attitude → body-rate
   PID controller. Yaw automatically points toward the next waypoint when the
   horizontal travel exceeds 1 m.
-- **Real-time UDP telemetry** — JSON packets on port `14550` (default) at 50 Hz
-  carrying position, velocity, attitude, body rates, thrust, and current
-  waypoint.
+- **Real-time UDP telemetry over multicast** — JSON packets published to
+  multicast group `239.0.0.1:14550` (default) at 50 Hz carrying position,
+  velocity, attitude, body rates, thrust, current waypoint and sim status.
+  Any number of listeners (GCS, loggers, analysis tools) can join the group
+  and receive the same stream; pass a unicast IP to `--host` to fall back to
+  point-to-point UDP.
+- **Automatic trajectory saving** — the 10 ms trajectory buffer is written to
+  a timestamped CSV automatically when the mission completes (vehicle settled
+  at the final waypoint) and again on simulator shutdown if unsaved samples
+  remain; disable with `--no-autosave`.
 - **GCS-controlled flight** — the simulator boots in a WAITING state and only
   flies when the GCS sends ``start``; ``pause`` / ``resume`` / ``reset`` give
   full flight control from the ground station (or pass ``--autostart`` to fly
@@ -29,7 +36,8 @@ position on a map and its attitude in 3D.
   - 3D attitude view rendered as a quadcopter (arms + filled rotor disks +
     body box + heading arrow; front rotors red, rear rotors blue),
   - mission picker — radio-button list of the waypoint ``*.json`` files found
-    in the missions directory; selecting one uploads it to the simulator,
+    in the missions directory; selecting one uploads it to the simulator, and
+    a **Refresh list** button rescans the directory for new files,
   - waypoint list panel with the active waypoint highlighted in red,
   - textual telemetry bar (sim status, time, lat/lon/alt, speed,
     roll/pitch/yaw, active WP),
@@ -106,7 +114,8 @@ You typically run the GCS first (so it is listening) and then the simulator.
 ```bash
 python run_gcs.py
 # Optional flags:
-#   --host 0.0.0.0           # UDP bind host for telemetry (default 0.0.0.0)
+#   --host 239.0.0.1         # multicast group to join (default), or a local
+#                            # bind address for unicast telemetry
 #   --port 14550             # UDP bind port for telemetry (default 14550)
 #   --cmd-host 127.0.0.1     # destination host for outbound commands
 #   --cmd-port 14551         # destination port for outbound commands
@@ -122,8 +131,10 @@ python run_sim.py
 #   --waypoints waypoints.json   # initial mission file (default waypoints.json)
 #   --drone drone.json           # vehicle / autopilot limits (default drone.json;
 #                                # silently skipped if the file does not exist)
-#   --host 127.0.0.1             # UDP destination host (telemetry)
+#   --host 239.0.0.1             # telemetry destination: multicast group
+#                                # (default) or a unicast IP
 #   --port 14550                 # UDP destination port (telemetry)
+#   --mcast-ttl 1                # multicast TTL (1 = local subnet)
 #   --cmd-host 0.0.0.0           # UDP bind host for inbound GCS commands
 #   --cmd-port 14551             # UDP bind port for inbound GCS commands
 #   --duration 60                # stop after N seconds of sim time
@@ -131,6 +142,7 @@ python run_sim.py
 #   --telem-hz 50                # telemetry transmit rate
 #   --autostart                  # fly immediately instead of waiting for the
 #                                # GCS start command
+#   --no-autosave                # disable automatic trajectory CSV saving
 ```
 
 By default the simulator starts in the **WAITING** state: it sends low-rate
@@ -155,7 +167,9 @@ simulated time.
   in ``--missions-dir`` that contains a ``waypoints`` list (files such as
   ``drone.json`` are skipped automatically). Selecting a file uploads it via
   ``load_mission``, refreshes the map / 3D / waypoint-list panels, and puts
-  the simulator back into WAITING.
+  the simulator back into WAITING. The **Refresh list** button above the
+  picker rescans the directory (preserving the current selection) so
+  newly added mission files appear without restarting the GCS.
 - **Waypoint list (sidebar)** — index, latitude, longitude and altitude of
   every waypoint in the current mission; the active target is highlighted in
   red as the flight progresses.
@@ -187,6 +201,15 @@ Waypoints are defined in JSON:
   hovers indefinitely at the final waypoint.
 
 ## UDP Telemetry Format
+
+Telemetry is published to multicast group `239.0.0.1:14550` by default, so
+several consumers can listen simultaneously — e.g. the GCS plus a CSV logger
+plus a plotting tool. `UDPTelemetryReceiver` joins the group automatically
+when given a multicast address; multiple receivers may share the same port
+(`SO_REUSEADDR`). To use plain unicast instead, pass a normal IP to both
+sides (e.g. `run_sim.py --host 127.0.0.1` and `run_gcs.py --host 0.0.0.0`).
+The multicast TTL defaults to 1 (local subnet); raise it with
+`run_sim.py --mcast-ttl N` if listeners sit behind a router.
 
 Each packet is a UTF-8 encoded JSON object:
 
@@ -245,6 +268,11 @@ t,lat,lon,alt,north,east,down,vn,ve,vd,roll_rad,pitch_rad,yaw_rad,p,q,r,thrust,w
 
 Triggering a save:
 
+- **Automatically** — when the mission completes (vehicle settled inside the
+  accept radius of the final waypoint at < 0.5 m/s), the buffer is saved to
+  `trajectory_<timestamp>.csv` in the simulator's CWD; on simulator shutdown
+  any samples recorded since the last save are saved the same way. Disable
+  both with `--no-autosave`.
 - **From the GCS** — click *Save trajectory CSV*; pick a path (or cancel to
   let the simulator default to `trajectory_<timestamp>.csv` in its CWD).
 - **Programmatically** — send `{"type":"save_trajectory","path":"out.csv"}`
