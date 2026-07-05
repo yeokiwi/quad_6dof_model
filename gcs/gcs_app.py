@@ -257,7 +257,10 @@ class GCSApp:
                                      linewidth=1.5, label="Trail")
         (self.vehicle_dot,) = ax.plot([], [], "o", color="tab:red",
                                       markersize=10, label="Vehicle")
-        ax.set_aspect("equal", adjustable="datalim")
+        # _autoscale_map() pins both x/y limits with equalized spans, so the
+        # aspect must adapt the box, not the data limits — with "datalim"
+        # matplotlib overrides one of our fixed limits and warns every frame.
+        ax.set_aspect("equal", adjustable="box")
         self._draw_planned_overlay()
         self._autoscale_map()
         ax.legend(loc="upper right", fontsize=8)
