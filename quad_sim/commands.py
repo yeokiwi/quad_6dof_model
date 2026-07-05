@@ -2,9 +2,20 @@
 
 Messages are simple JSON objects with a ``type`` field. Two types are defined:
 
+  {"type": "start"}
+      Begin the flight (from the WAITING state). If the sim is paused this
+      behaves like ``resume``.
+
+  {"type": "pause"}
+      Freeze the simulation (physics stops; state is held).
+
+  {"type": "resume"}
+      Continue a paused simulation from the held state.
+
   {"type": "reset"}
       Reset the vehicle to (0, 0, 0) at the home point, zero attitude and
-      velocity, replay the current mission from the first waypoint.
+      velocity, replay the current mission from the first waypoint. The sim
+      returns to the WAITING state (send ``start`` to fly again).
 
   {"type": "load_mission",
    "home": {"lat": ..., "lon": ..., "alt": ...},   (optional)
@@ -38,6 +49,15 @@ class CommandSender:
             self.sock.sendto(json.dumps(msg).encode("utf-8"), self.addr)
         except OSError:
             pass
+
+    def start(self) -> None:
+        self.send({"type": "start"})
+
+    def pause(self) -> None:
+        self.send({"type": "pause"})
+
+    def resume(self) -> None:
+        self.send({"type": "resume"})
 
     def reset(self) -> None:
         self.send({"type": "reset"})

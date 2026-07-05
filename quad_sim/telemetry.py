@@ -29,6 +29,7 @@ class TelemetryPacket:
     wp_lat: float
     wp_lon: float
     wp_alt: float
+    status: str = "running"  # waiting | running | paused
 
     def to_bytes(self) -> bytes:
         return json.dumps(asdict(self)).encode("utf-8")

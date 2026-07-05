@@ -1,9 +1,15 @@
 """Top-level simulation loop wiring dynamics, controller, waypoints and telemetry.
 
-A separate UDP command listener thread accepts ``reset``, ``load_mission`` and
-``save_trajectory`` messages from the GCS at runtime; commands are drained
-between physics steps in the main loop, so updates are atomic with respect to
-integration.
+A separate UDP command listener thread accepts ``start``, ``pause``,
+``resume``, ``reset``, ``load_mission`` and ``save_trajectory`` messages from
+the GCS at runtime; commands are drained between physics steps in the main
+loop, so updates are atomic with respect to integration.
+
+Run-state machine: the sim boots in WAITING (unless ``SimConfig.autostart``)
+and only steps physics while RUNNING. ``pause`` freezes the state; ``resume``
+or ``start`` continues it; ``reset`` / ``load_mission`` return to WAITING.
+While not running, a low-rate telemetry heartbeat (wall-clock scheduled) keeps
+the GCS informed of the current state and status.
 
 In addition to telemetry, every 10 ms of sim time the simulator appends a row
 to an in-memory trajectory buffer. The ``save_trajectory`` command writes the
@@ -51,6 +57,8 @@ class SimConfig:
     cmd_host: str = "0.0.0.0"
     cmd_port: int = 14551
     cmd_enabled: bool = True
+    autostart: bool = False
+    idle_telem_rate_hz: float = 5.0
 
 
 class Simulator:
@@ -71,6 +79,7 @@ class Simulator:
         self.t = 0.0
         self._wall_start = 0.0
         self._next_telem_t = 0.0
+        self.run_state = "running" if self.cfg.autostart else "waiting"
         self.sender = UDPTelemetrySender(self.cfg.udp_host, self.cfg.udp_port)
 
         self._cmd_queue: queue.Queue = queue.Queue()
@@ -121,9 +130,25 @@ class Simulator:
 
     def _apply_command(self, msg: dict) -> None:
         typ = msg.get("type")
-        if typ == "reset":
+        if typ == "start":
+            if self.run_state in ("waiting", "paused"):
+                self._resume_clock()
+                self.run_state = "running"
+                print("[sim] flight started")
+        elif typ == "pause":
+            if self.run_state == "running":
+                self.run_state = "paused"
+                print(f"[sim] paused at t={self.t:.2f}s")
+        elif typ == "resume":
+            if self.run_state == "paused":
+                self._resume_clock()
+                self.run_state = "running"
+                print(f"[sim] resumed at t={self.t:.2f}s")
+        elif typ == "reset":
             self._reset_vehicle()
-            print(f"[sim] reset (replaying {len(self.wpm.waypoints)} waypoints)")
+            self.run_state = "waiting"
+            print(f"[sim] reset; waiting for start "
+                  f"({len(self.wpm.waypoints)} waypoints)")
         elif typ == "load_mission":
             wp_dicts = msg.get("waypoints") or []
             wps = [GeoPoint(**w) for w in wp_dicts]
@@ -135,11 +160,18 @@ class Simulator:
             self.wpm = WaypointManager(wps, self.converter,
                                        accept_radius=self.cfg.accept_radius)
             self._reset_vehicle()
-            print(f"[sim] new mission loaded ({len(wps)} waypoints)")
+            self.run_state = "waiting"
+            print(f"[sim] new mission loaded ({len(wps)} waypoints); "
+                  f"waiting for start")
         elif typ == "save_trajectory":
             self._spawn_save_trajectory(msg.get("path"))
         else:
             raise ValueError(f"unknown command type: {typ!r}")
+
+    def _resume_clock(self) -> None:
+        """Re-anchor the wall clock so real-time pacing continues from the
+        current sim time instead of trying to catch up the paused interval."""
+        self._wall_start = time.perf_counter() - self.t
 
     def _reset_vehicle(self) -> None:
         # Rebuild waypoint manager so we replay from index 0 with the same plan.
@@ -218,19 +250,32 @@ class Simulator:
             wp_lat=target.geo.lat,
             wp_lon=target.geo.lon,
             wp_alt=target.geo.alt,
+            status=self.run_state,
         )
 
     # ----- Main loop -----
     def run(self) -> None:
         dt = self.cfg.dt
         telem_period = 1.0 / self.cfg.telem_rate_hz
+        idle_period = 1.0 / self.cfg.idle_telem_rate_hz
         self._next_telem_t = 0.0
         self._next_traj_t = 0.0
         self._wall_start = time.perf_counter()
+        next_idle_wall = 0.0
         last_u = np.zeros(4)
         try:
             while True:
                 self._drain_commands()
+
+                if self.run_state != "running":
+                    # Idle: hold state, heartbeat telemetry at a low rate so
+                    # the GCS sees the current status, then sleep briefly.
+                    now = time.perf_counter()
+                    if now >= next_idle_wall:
+                        self.sender.send(self._build_packet(last_u))
+                        next_idle_wall = now + idle_period
+                    time.sleep(0.02)
+                    continue
 
                 target = self.wpm.update(self.state.pos)
                 u = self.controller.compute(self.state, target.ned, dt)

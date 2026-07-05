@@ -17,20 +17,28 @@ position on a map and its attitude in 3D.
 - **Real-time UDP telemetry** — JSON packets on port `14550` (default) at 50 Hz
   carrying position, velocity, attitude, body rates, thrust, and current
   waypoint.
+- **GCS-controlled flight** — the simulator boots in a WAITING state and only
+  flies when the GCS sends ``start``; ``pause`` / ``resume`` / ``reset`` give
+  full flight control from the ground station (or pass ``--autostart`` to fly
+  immediately).
 - **Live GCS UI** — single matplotlib window with:
   - 2D map view showing planned waypoints and the live lat/lon breadcrumb;
     the view auto-scales to comfortably fit all waypoints + trail + vehicle,
+  - 3D trajectory view (lon / lat / altitude) showing the flown path, current
+    position and the planned waypoint sequence,
   - 3D attitude view rendered as a quadcopter (arms + filled rotor disks +
     body box + heading arrow; front rotors red, rear rotors blue),
-  - textual telemetry bar (time, lat/lon/alt, speed, roll/pitch/yaw, target WP),
-  - **Reset mission** button — replays the current mission from waypoint 0,
-  - **Load waypoints.json** button — file picker to upload a new mission to
-    the simulator at runtime,
+  - mission picker — radio-button list of the waypoint ``*.json`` files found
+    in the missions directory; selecting one uploads it to the simulator,
+  - waypoint list panel with the active waypoint highlighted in red,
+  - textual telemetry bar (sim status, time, lat/lon/alt, speed,
+    roll/pitch/yaw, active WP),
+  - **Start / Stop / Continue / Reset** flight-control buttons,
   - **Save trajectory CSV** button — writes the simulator's 10 ms-cadence
     trajectory buffer to a CSV file.
 - **GCS → Simulator command channel** — JSON over UDP (default port 14551)
-  carrying ``reset``, ``load_mission`` and ``save_trajectory`` commands; see
-  ``quad_sim/commands.py``.
+  carrying ``start``, ``pause``, ``resume``, ``reset``, ``load_mission`` and
+  ``save_trajectory`` commands; see ``quad_sim/commands.py``.
 - **Configurable vehicle limits** — ``drone.json`` lets the user set the
   maximum speed, climb rate, and per-axis (roll/pitch/yaw) angular rate
   limits, plus mass / thrust / inertia / drag if needed. Loaded automatically
@@ -102,7 +110,8 @@ python run_gcs.py
 #   --port 14550             # UDP bind port for telemetry (default 14550)
 #   --cmd-host 127.0.0.1     # destination host for outbound commands
 #   --cmd-port 14551         # destination port for outbound commands
-#   --waypoints waypoints.json   # overlay planned waypoints on the map
+#   --waypoints waypoints.json   # initially displayed mission
+#   --missions-dir .         # directory scanned for selectable mission files
 ```
 
 **Terminal 2 — Simulator:**
@@ -120,23 +129,36 @@ python run_sim.py
 #   --duration 60                # stop after N seconds of sim time
 #   --no-realtime                # run as fast as possible (no wall-clock pacing)
 #   --telem-hz 50                # telemetry transmit rate
+#   --autostart                  # fly immediately instead of waiting for the
+#                                # GCS start command
 ```
 
+By default the simulator starts in the **WAITING** state: it sends low-rate
+status telemetry but does not fly until the GCS **Start** button is pressed.
 The default mission climbs to 30 m, flies a square at 30/50 m altitude, and
 returns to a 5 m hover. The full pattern completes in roughly 42 seconds of
 simulated time.
 
 ### GCS controls
 
-- **Reset mission** — sends a ``reset`` command to the simulator. The vehicle
-  is returned to (0, 0, 0) at the home point with zero velocity / attitude,
-  the controller integrators are zeroed, and the current waypoint plan is
-  replayed from waypoint 0. The local map trail is cleared.
-- **Load waypoints.json** — opens a file picker (tkinter); the selected file
-  is parsed and a ``load_mission`` command is sent to the simulator. If the
-  file specifies a ``home``, the simulator's local NED origin is moved to it.
-  The map overlay is refreshed, the trail cleared, and the map auto-rescaled
-  to fit the new mission.
+- **Start** — begins the flight from the WAITING state (also resumes a
+  paused flight).
+- **Stop** — pauses the simulation; the vehicle state is frozen in place.
+- **Continue** — resumes a paused flight from the exact held state; the
+  paused wall-clock time is not "caught up".
+- **Reset** — sends a ``reset`` command. The vehicle is returned to
+  (0, 0, 0) at the home point with zero velocity / attitude, the controller
+  integrators are zeroed, the waypoint plan rewinds to waypoint 0, the local
+  trail is cleared, and the simulator returns to WAITING (press Start to fly
+  again).
+- **Mission picker (sidebar)** — radio-button list of every ``*.json`` file
+  in ``--missions-dir`` that contains a ``waypoints`` list (files such as
+  ``drone.json`` are skipped automatically). Selecting a file uploads it via
+  ``load_mission``, refreshes the map / 3D / waypoint-list panels, and puts
+  the simulator back into WAITING.
+- **Waypoint list (sidebar)** — index, latitude, longitude and altitude of
+  every waypoint in the current mission; the active target is highlighted in
+  red as the flight progresses.
 - **Save trajectory CSV** — opens a Save-As dialog and sends a
   ``save_trajectory`` command to the simulator. The simulator writes the
   full 10 ms-cadence buffer to that path on its host. If the dialog is
@@ -179,6 +201,7 @@ Each packet is a UTF-8 encoded JSON object:
 | `thrust` | Commanded collective thrust [N] |
 | `wp_index` | Active waypoint index |
 | `wp_lat`, `wp_lon`, `wp_alt` | Active waypoint coordinates |
+| `status` | Simulator run state: `waiting`, `running` or `paused` |
 
 Any client that can read UDP and parse JSON can consume the stream — see
 `quad_sim/telemetry.py` (`TelemetryPacket`, `UDPTelemetryReceiver`) for the
@@ -233,11 +256,14 @@ the GCS during local development).
 
 ## GCS → Simulator Command Format
 
-Commands are JSON UDP packets (default destination port 14551). Three types
-are supported:
+Commands are JSON UDP packets (default destination port 14551). Supported
+types:
 
 ```json
-{"type": "reset"}
+{"type": "start"}     // begin flight from WAITING (or resume if paused)
+{"type": "pause"}     // freeze the simulation in place
+{"type": "resume"}    // continue a paused flight
+{"type": "reset"}     // re-home the vehicle, rewind mission, back to WAITING
 ```
 
 ```json
@@ -258,10 +284,11 @@ are supported:
 The ``home`` field is optional in ``load_mission``; if omitted, the existing
 NED origin is preserved and only the waypoint list is swapped. ``reset`` and
 ``load_mission`` both reset the vehicle state, the controller integrators,
-sim time, and the trajectory buffer. ``save_trajectory.path`` is optional;
-if omitted, the simulator picks a timestamped filename in its current
-working directory. See ``quad_sim/commands.py`` for the reference
-``CommandSender`` / ``CommandReceiver`` helpers.
+sim time, and the trajectory buffer, and return the simulator to the WAITING
+state — send ``start`` to fly. ``save_trajectory.path`` is optional; if
+omitted, the simulator picks a timestamped filename in its current working
+directory. See ``quad_sim/commands.py`` for the reference ``CommandSender``
+/ ``CommandReceiver`` helpers.
 
 ## Coordinate Conventions
 

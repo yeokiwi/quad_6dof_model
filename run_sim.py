@@ -36,6 +36,9 @@ def main():
                     help="UDP bind host for inbound GCS commands")
     ap.add_argument("--cmd-port", type=int, default=14551,
                     help="UDP bind port for inbound GCS commands")
+    ap.add_argument("--autostart", action="store_true",
+                    help="Start flying immediately instead of waiting for the "
+                         "GCS start command")
     args = ap.parse_args()
 
     home, wps = load_waypoints(args.waypoints)
@@ -57,12 +60,15 @@ def main():
         telem_rate_hz=args.telem_hz,
         cmd_host=args.cmd_host,
         cmd_port=args.cmd_port,
+        autostart=args.autostart,
     )
     sim = Simulator(home=home, waypoints_geo=wps, config=cfg,
                     quad_params=params, gains=gains)
     print(f"Sending UDP telemetry to {args.host}:{args.port}")
     print(f"Listening for GCS commands on {args.cmd_host}:{args.cmd_port}")
     print(f"Home: {home.lat:.6f}, {home.lon:.6f}  ({len(wps)} waypoints)")
+    if not args.autostart:
+        print("Waiting for GCS start command...")
     try:
         sim.run()
     except KeyboardInterrupt:

@@ -1,22 +1,28 @@
 """Ground control station: UDP telemetry listener + live visualisation.
 
 Layout:
-  - Top row: 2D map view (lat/lon trail + planned waypoints) and 3D attitude
-    view (quadcopter body rendered as arms + rotor disks + heading arrow).
-  - Telemetry text bar.
-  - Button row: Reset (replay current mission), Load Mission (file picker
-    for waypoints.json).
+  - Top row: 2D map view | 3D trajectory view | 3D attitude view, plus a
+    sidebar with a mission-file picker (radio buttons over *.json files in
+    the missions directory) and the current waypoint list (active waypoint
+    highlighted).
+  - Telemetry text bar (includes the simulator run status).
+  - Button row: Start | Stop | Continue | Reset | Save trajectory CSV.
 
 Communication:
   - Telemetry comes from the simulator over UDP (default port 14550).
-  - Commands are sent to the simulator over a separate UDP port (default 14551)
-    using the JSON protocol defined in ``quad_sim.commands``.
+  - Commands are sent to the simulator over a separate UDP port (default
+    14551) using the JSON protocol defined in ``quad_sim.commands``.
+
+The simulator boots in the WAITING state: select a mission (optional) and
+press Start to fly. Stop pauses the flight, Continue resumes it, Reset
+returns the vehicle to home and back to WAITING.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,12 +30,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, RadioButtons
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from quad_sim.commands import CommandSender
 from quad_sim.telemetry import TelemetryPacket, UDPTelemetryReceiver
 from quad_sim.waypoints import load_waypoints
+
+MAX_MISSION_FILES = 10
 
 
 @dataclass
@@ -37,11 +45,13 @@ class SharedState:
     latest: TelemetryPacket | None = None
     trail_lat: deque = None
     trail_lon: deque = None
+    trail_alt: deque = None
     lock: threading.Lock = None
 
     def __post_init__(self):
-        self.trail_lat = deque(maxlen=2000)
-        self.trail_lon = deque(maxlen=2000)
+        self.trail_lat = deque(maxlen=4000)
+        self.trail_lon = deque(maxlen=4000)
+        self.trail_alt = deque(maxlen=4000)
         self.lock = threading.Lock()
 
 
@@ -54,8 +64,12 @@ def receiver_thread(host: str, port: int, shared: SharedState, stop: threading.E
                 continue
             with shared.lock:
                 shared.latest = pkt
-                shared.trail_lat.append(pkt.lat)
-                shared.trail_lon.append(pkt.lon)
+                # Only extend the trail while flying; idle heartbeats would
+                # otherwise pile identical points onto the trail.
+                if pkt.status == "running":
+                    shared.trail_lat.append(pkt.lat)
+                    shared.trail_lon.append(pkt.lon)
+                    shared.trail_alt.append(pkt.alt)
     finally:
         rx.close()
 
@@ -69,6 +83,24 @@ def _rotation_body_to_ned(roll: float, pitch: float, yaw: float) -> np.ndarray:
         [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
         [-sp,   cp*sr,            cp*cr],
     ])
+
+
+def scan_mission_files(directory: str | Path) -> list[Path]:
+    """Return waypoint-mission JSON files in ``directory`` (sorted by name).
+
+    A file qualifies if it parses as JSON and has a non-empty ``waypoints``
+    list; this skips unrelated JSON such as drone.json.
+    """
+    found = []
+    for p in sorted(Path(directory).glob("*.json")):
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("waypoints"), list) \
+                and data["waypoints"]:
+            found.append(p)
+    return found[:MAX_MISSION_FILES]
 
 
 # --- Quadcopter geometry, expressed in the FRD body frame ---------------------
@@ -104,12 +136,12 @@ _BODY_VERTS = np.array([
     [-_BODY_HX, +_BODY_HY, -_BODY_HZ],
 ])
 _BODY_FACES = [
-    [0, 1, 2, 3],  # bottom (+z body)
-    [4, 5, 6, 7],  # top    (-z body)
-    [0, 1, 5, 4],  # right
-    [2, 3, 7, 6],  # left
-    [0, 3, 7, 4],  # front
-    [1, 2, 6, 5],  # rear
+    [0, 1, 2, 3],
+    [4, 5, 6, 7],
+    [0, 1, 5, 4],
+    [2, 3, 7, 6],
+    [0, 3, 7, 4],
+    [1, 2, 6, 5],
 ]
 
 
@@ -117,58 +149,102 @@ class GCSApp:
     def __init__(self,
                  host: str, port: int,
                  cmd_host: str, cmd_port: int,
-                 waypoints_path: str | None):
+                 waypoints_path: str | None,
+                 missions_dir: str = "."):
         self.shared = SharedState()
         self.stop = threading.Event()
         self.host = host
         self.port = port
         self.commands = CommandSender(host=cmd_host, port=cmd_port)
         self.cmd_target = (cmd_host, cmd_port)
+        self.missions_dir = missions_dir
 
         self.wp_lat: list[float] = []
         self.wp_lon: list[float] = []
-        if waypoints_path:
+        self.wp_alt: list[float] = []
+        self.mission_name = ""
+        if waypoints_path and Path(waypoints_path).exists():
             try:
-                _, wps = load_waypoints(waypoints_path)
-                self.wp_lat = [w.lat for w in wps]
-                self.wp_lon = [w.lon for w in wps]
-            except FileNotFoundError:
-                print(f"Waypoints file not found: {waypoints_path} (continuing without)")
+                self._set_waypoints_from_file(waypoints_path)
+            except (ValueError, KeyError) as e:
+                print(f"[gcs] could not parse {waypoints_path}: {e}")
 
-        self.fig = plt.figure(figsize=(14, 8))
+        self.mission_files = scan_mission_files(missions_dir)
+
+        # ----- Figure layout -----
+        self.fig = plt.figure(figsize=(17, 9))
         self.fig.suptitle(
             f"Quadcopter GCS  -  telemetry {host}:{port}  cmd -> {cmd_host}:{cmd_port}"
         )
-        gs = self.fig.add_gridspec(3, 4, height_ratios=[18, 1, 2], hspace=0.35)
-        self.ax_map = self.fig.add_subplot(gs[0, :2])
-        self.ax_att = self.fig.add_subplot(gs[0, 2:], projection="3d")
+        gs = self.fig.add_gridspec(
+            3, 4, width_ratios=[5, 5, 5, 2.6], height_ratios=[18, 1, 2],
+            hspace=0.35, wspace=0.30,
+            left=0.05, right=0.98, top=0.92, bottom=0.05,
+        )
+        self.ax_map = self.fig.add_subplot(gs[0, 0])
+        self.ax_traj3d = self.fig.add_subplot(gs[0, 1], projection="3d")
+        self.ax_att = self.fig.add_subplot(gs[0, 2], projection="3d")
+
+        side = gs[0, 3].subgridspec(2, 1, height_ratios=[1, 1.4], hspace=0.30)
+        self.ax_missions = self.fig.add_subplot(side[0])
+        self.ax_wplist = self.fig.add_subplot(side[1])
+
         self.ax_text = self.fig.add_subplot(gs[1, :])
         self.ax_text.axis("off")
-        self.ax_btn_reset = self.fig.add_subplot(gs[2, 0])
-        self.ax_btn_load = self.fig.add_subplot(gs[2, 1])
-        self.ax_btn_save = self.fig.add_subplot(gs[2, 2])
-        # Leave gs[2, 3] empty for spacing.
 
+        btn_row = gs[2, :].subgridspec(1, 5, wspace=0.25)
+        self.ax_btn_start = self.fig.add_subplot(btn_row[0])
+        self.ax_btn_stop = self.fig.add_subplot(btn_row[1])
+        self.ax_btn_cont = self.fig.add_subplot(btn_row[2])
+        self.ax_btn_reset = self.fig.add_subplot(btn_row[3])
+        self.ax_btn_save = self.fig.add_subplot(btn_row[4])
+
+        # ----- Panes -----
         self._planned_line = None
         self._planned_labels: list = []
         self._setup_map()
+        self._setup_traj3d()
         self._setup_attitude()
+        self._setup_missions_panel(waypoints_path)
+        self._wplist_artists: list = []
+        self._wplist_active = -1
+        self._rebuild_wplist()
+
         self.text_artist = self.ax_text.text(
             0.01, 0.5, "Waiting for telemetry...",
             transform=self.ax_text.transAxes,
             fontsize=10, family="monospace", va="center",
         )
         self._status_msg = ""
-        self._status_until_t: float | None = None
+        self._status_until_wall: float | None = None
 
-        self.btn_reset = Button(self.ax_btn_reset, "Reset mission")
-        self.btn_load = Button(self.ax_btn_load, "Load waypoints.json")
+        # ----- Buttons -----
+        self.btn_start = Button(self.ax_btn_start, "Start", color="palegreen",
+                                hovercolor="lightgreen")
+        self.btn_stop = Button(self.ax_btn_stop, "Stop", color="lightsalmon",
+                               hovercolor="salmon")
+        self.btn_cont = Button(self.ax_btn_cont, "Continue")
+        self.btn_reset = Button(self.ax_btn_reset, "Reset")
         self.btn_save = Button(self.ax_btn_save, "Save trajectory CSV")
+        self.btn_start.on_clicked(self._on_start)
+        self.btn_stop.on_clicked(self._on_stop)
+        self.btn_cont.on_clicked(self._on_continue)
         self.btn_reset.on_clicked(self._on_reset)
-        self.btn_load.on_clicked(self._on_load)
         self.btn_save.on_clicked(self._on_save_trajectory)
 
-    # ----- Map setup -----
+    # ----- Mission helpers -----
+    def _set_waypoints_from_file(self, path: str | Path) -> tuple[dict | None, list[dict]]:
+        data = json.loads(Path(path).read_text())
+        wps = data.get("waypoints") or []
+        if not wps:
+            raise ValueError(f"{path} has no 'waypoints'")
+        self.wp_lat = [w["lat"] for w in wps]
+        self.wp_lon = [w["lon"] for w in wps]
+        self.wp_alt = [w.get("alt", 0.0) for w in wps]
+        self.mission_name = Path(path).name
+        return data.get("home"), wps
+
+    # ----- Map (2D) -----
     def _setup_map(self):
         ax = self.ax_map
         ax.set_title("Map view (geodetic)")
@@ -176,6 +252,7 @@ class GCSApp:
         ax.set_ylabel("Latitude [deg]")
         ax.grid(True, linestyle="--", alpha=0.4)
         ax.ticklabel_format(useOffset=False, style="plain")
+        ax.tick_params(labelsize=8)
         (self.trail_line,) = ax.plot([], [], "-", color="tab:blue",
                                      linewidth=1.5, label="Trail")
         (self.vehicle_dot,) = ax.plot([], [], "o", color="tab:red",
@@ -184,34 +261,6 @@ class GCSApp:
         self._draw_planned_overlay()
         self._autoscale_map()
         ax.legend(loc="upper right", fontsize=8)
-
-    def _autoscale_map(self):
-        """Set map limits to fit all waypoints + the live trail + vehicle.
-
-        Padded by 10% of the longest span so points sit comfortably inside
-        the axes rather than on the edge. The lat/lon spans are equalized to
-        avoid one axis becoming pencil-thin when the mission is mostly
-        north-south or east-west.
-        """
-        lats: list[float] = list(self.wp_lat)
-        lons: list[float] = list(self.wp_lon)
-        with self.shared.lock:
-            lats.extend(self.shared.trail_lat)
-            lons.extend(self.shared.trail_lon)
-            if self.shared.latest is not None:
-                lats.append(self.shared.latest.lat)
-                lons.append(self.shared.latest.lon)
-        if not lats or not lons:
-            return
-        lat_min, lat_max = min(lats), max(lats)
-        lon_min, lon_max = min(lons), max(lons)
-        span = max(lat_max - lat_min, lon_max - lon_min, 1e-4)
-        margin = 0.10 * span
-        half = 0.5 * span + margin
-        lat_c = 0.5 * (lat_min + lat_max)
-        lon_c = 0.5 * (lon_min + lon_max)
-        self.ax_map.set_xlim(lon_c - half, lon_c + half)
-        self.ax_map.set_ylim(lat_c - half, lat_c + half)
 
     def _draw_planned_overlay(self):
         ax = self.ax_map
@@ -237,19 +286,85 @@ class GCSApp:
                 t = ax.annotate(str(i), (lo, la), textcoords="offset points",
                                 xytext=(5, 5), fontsize=8, color="tab:orange")
                 self._planned_labels.append(t)
-            ax.set_xlim(min(self.wp_lon) - 0.0003, max(self.wp_lon) + 0.0003)
-            ax.set_ylim(min(self.wp_lat) - 0.0003, max(self.wp_lat) + 0.0003)
 
-    # ----- Attitude setup -----
+    def _autoscale_map(self):
+        """Fit all waypoints + trail + vehicle with 10% margin and equalized
+        lat/lon spans (avoids a pencil-thin axis for linear missions)."""
+        lats: list[float] = list(self.wp_lat)
+        lons: list[float] = list(self.wp_lon)
+        with self.shared.lock:
+            lats.extend(self.shared.trail_lat)
+            lons.extend(self.shared.trail_lon)
+            if self.shared.latest is not None:
+                lats.append(self.shared.latest.lat)
+                lons.append(self.shared.latest.lon)
+        if not lats or not lons:
+            return
+        lat_min, lat_max = min(lats), max(lats)
+        lon_min, lon_max = min(lons), max(lons)
+        span = max(lat_max - lat_min, lon_max - lon_min, 1e-4)
+        half = 0.5 * span + 0.10 * span
+        lat_c = 0.5 * (lat_min + lat_max)
+        lon_c = 0.5 * (lon_min + lon_max)
+        self.ax_map.set_xlim(lon_c - half, lon_c + half)
+        self.ax_map.set_ylim(lat_c - half, lat_c + half)
+
+    # ----- Trajectory (3D) -----
+    def _setup_traj3d(self):
+        ax = self.ax_traj3d
+        ax.set_title("3D trajectory")
+        ax.set_xlabel("Lon [deg]", fontsize=8)
+        ax.set_ylabel("Lat [deg]", fontsize=8)
+        ax.set_zlabel("Alt [m]", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.ticklabel_format(useOffset=False, style="plain")
+        (self.traj3d_planned,) = ax.plot([], [], [], "o--", color="tab:orange",
+                                         markersize=5, label="Waypoints")
+        (self.traj3d_trail,) = ax.plot([], [], [], "-", color="tab:blue",
+                                       linewidth=1.5, label="Trail")
+        (self.traj3d_dot,) = ax.plot([], [], [], "o", color="tab:red",
+                                     markersize=8, label="Vehicle")
+        ax.legend(loc="upper left", fontsize=7)
+        self._update_traj3d_planned()
+        self._autoscale_traj3d()
+
+    def _update_traj3d_planned(self):
+        self.traj3d_planned.set_data(self.wp_lon, self.wp_lat)
+        self.traj3d_planned.set_3d_properties(self.wp_alt)
+
+    def _autoscale_traj3d(self):
+        lats: list[float] = list(self.wp_lat)
+        lons: list[float] = list(self.wp_lon)
+        alts: list[float] = list(self.wp_alt)
+        with self.shared.lock:
+            lats.extend(self.shared.trail_lat)
+            lons.extend(self.shared.trail_lon)
+            alts.extend(self.shared.trail_alt)
+        if not lats:
+            return
+        lat_min, lat_max = min(lats), max(lats)
+        lon_min, lon_max = min(lons), max(lons)
+        span = max(lat_max - lat_min, lon_max - lon_min, 1e-4)
+        half = 0.5 * span + 0.10 * span
+        lat_c = 0.5 * (lat_min + lat_max)
+        lon_c = 0.5 * (lon_min + lon_max)
+        self.ax_traj3d.set_xlim(lon_c - half, lon_c + half)
+        self.ax_traj3d.set_ylim(lat_c - half, lat_c + half)
+        alt_min, alt_max = (min(alts), max(alts)) if alts else (0.0, 1.0)
+        alt_pad = max(0.10 * (alt_max - alt_min), 1.0)
+        self.ax_traj3d.set_zlim(min(0.0, alt_min - alt_pad), alt_max + alt_pad)
+
+    # ----- Attitude (3D) -----
     def _setup_attitude(self):
         ax = self.ax_att
         ax.set_title("Attitude (body axes in NED)")
         ax.set_xlim(-1.2, 1.2)
         ax.set_ylim(-1.2, 1.2)
         ax.set_zlim(-1.2, 1.2)
-        ax.set_xlabel("North")
-        ax.set_ylabel("East")
-        ax.set_zlabel("Down")
+        ax.set_xlabel("North", fontsize=8)
+        ax.set_ylabel("East", fontsize=8)
+        ax.set_zlabel("Down", fontsize=8)
+        ax.tick_params(labelsize=7)
         ax.invert_zaxis()
         gx, gy = np.meshgrid(np.linspace(-1, 1, 5), np.linspace(-1, 1, 5))
         ax.plot_wireframe(gx, gy, np.zeros_like(gx), color="lightgray",
@@ -266,9 +381,8 @@ class GCSApp:
         self._att_artists = []
 
         R = _rotation_body_to_ned(roll, pitch, yaw)
-        Rt = R.T  # used as (points @ R.T) to map body->NED
+        Rt = R.T  # (points @ R.T) maps body -> NED
 
-        # Arms (X pattern crossing through the origin)
         arms_n = _ARM_TIPS @ Rt
         for i, j in [(0, 2), (1, 3)]:  # FR<->RL, FL<->RR
             ln, = ax.plot(
@@ -279,34 +393,113 @@ class GCSApp:
             )
             self._att_artists.append(ln)
 
-        # Rotor disks (filled), colored to indicate front (red) / rear (blue)
         for tip, color in zip(_ARM_TIPS, _ROTOR_COLORS):
-            disk_b = _DISK_TEMPLATE + tip
-            disk_n = disk_b @ Rt
-            poly = Poly3DCollection(
-                [disk_n], facecolor=color, alpha=0.55,
-                edgecolor=color, linewidths=1.0,
-            )
+            disk_n = (_DISK_TEMPLATE + tip) @ Rt
+            poly = Poly3DCollection([disk_n], facecolor=color, alpha=0.55,
+                                    edgecolor=color, linewidths=1.0)
             ax.add_collection3d(poly)
             self._att_artists.append(poly)
-            # Outline for visibility
             ln, = ax.plot(disk_n[:, 0], disk_n[:, 1], disk_n[:, 2],
                           color=color, linewidth=1.0)
             self._att_artists.append(ln)
 
-        # Body box (dark grey, semi-transparent)
         verts_n = _BODY_VERTS @ Rt
-        face_polys = [verts_n[face] for face in _BODY_FACES]
-        body = Poly3DCollection(face_polys, facecolor="dimgray", alpha=0.85,
+        body = Poly3DCollection([verts_n[f] for f in _BODY_FACES],
+                                facecolor="dimgray", alpha=0.85,
                                 edgecolor="black", linewidths=0.6)
         ax.add_collection3d(body)
         self._att_artists.append(body)
 
-        # Heading arrow (body +x, drawn ahead of the body)
         fwd = R[:, 0] * 0.95
         q = ax.quiver(0.0, 0.0, 0.0, fwd[0], fwd[1], fwd[2],
                       color="lime", linewidth=2.5, arrow_length_ratio=0.18)
         self._att_artists.append(q)
+
+    # ----- Missions panel -----
+    def _setup_missions_panel(self, initial_path: str | None):
+        ax = self.ax_missions
+        ax.set_title("Missions", fontsize=10)
+        self.mission_radio = None
+        if not self.mission_files:
+            ax.axis("off")
+            ax.text(0.5, 0.5, f"No mission files in\n{self.missions_dir}",
+                    ha="center", va="center", fontsize=8,
+                    transform=ax.transAxes)
+            return
+        labels = [p.name for p in self.mission_files]
+        active = 0
+        if initial_path:
+            try:
+                active = labels.index(Path(initial_path).name)
+            except ValueError:
+                pass
+        self.mission_radio = RadioButtons(ax, labels, active=active)
+        for lbl in self.mission_radio.labels:
+            lbl.set_fontsize(8)
+        self.mission_radio.on_clicked(self._on_mission_selected)
+
+    def _on_mission_selected(self, label: str):
+        path = Path(self.missions_dir) / label
+        try:
+            home, wps = self._set_waypoints_from_file(path)
+        except Exception as e:
+            self._flash(f"Load failed: {e}")
+            print(f"[gcs] failed to load mission '{path}': {e}")
+            return
+        self.commands.load_mission(home, wps)
+        self._clear_trail()
+        self._draw_planned_overlay()
+        self._autoscale_map()
+        self._update_traj3d_planned()
+        self._autoscale_traj3d()
+        self._rebuild_wplist()
+        self._flash(f"Uploaded {label} ({len(wps)} WPs); press Start")
+        print(f"[gcs] mission '{label}' uploaded ({len(wps)} waypoints)")
+
+    # ----- Waypoint list panel -----
+    def _rebuild_wplist(self):
+        ax = self.ax_wplist
+        for a in self._wplist_artists:
+            try:
+                a.remove()
+            except (ValueError, AttributeError):
+                pass
+        self._wplist_artists = []
+        ax.clear()
+        ax.axis("off")
+        title = f"Waypoints ({self.mission_name})" if self.mission_name else "Waypoints"
+        ax.set_title(title, fontsize=9)
+        if not self.wp_lat:
+            t = ax.text(0.5, 0.5, "(no mission)", ha="center", va="center",
+                        fontsize=8, transform=ax.transAxes)
+            self._wplist_artists.append(t)
+            return
+        n = len(self.wp_lat)
+        header = ax.text(0.02, 0.98, " #      lat        lon      alt",
+                         transform=ax.transAxes, fontsize=7.5,
+                         family="monospace", va="top", weight="bold")
+        self._wplist_artists.append(header)
+        for i, (la, lo, al) in enumerate(zip(self.wp_lat, self.wp_lon, self.wp_alt)):
+            y = 0.98 - (i + 1) * min(0.9 / (n + 1), 0.085)
+            t = ax.text(0.02, y,
+                        f"{i:2d} {la:10.5f} {lo:10.5f} {al:6.1f}",
+                        transform=ax.transAxes, fontsize=7.5,
+                        family="monospace", va="top", color="black")
+            self._wplist_artists.append(t)
+        self._wplist_active = -1  # force re-highlight on next frame
+
+    def _highlight_wplist(self, active_index: int):
+        if active_index == self._wplist_active:
+            return
+        self._wplist_active = active_index
+        # artists[0] is the header; waypoint rows start at 1
+        for i, t in enumerate(self._wplist_artists[1:]):
+            if i == active_index:
+                t.set_color("tab:red")
+                t.set_weight("bold")
+            else:
+                t.set_color("black")
+                t.set_weight("normal")
 
     # ----- Animation -----
     def _on_frame(self, _):
@@ -314,6 +507,7 @@ class GCSApp:
             pkt = self.shared.latest
             lats = list(self.shared.trail_lat)
             lons = list(self.shared.trail_lon)
+            alts = list(self.shared.trail_alt)
 
         if pkt is None:
             return []
@@ -322,73 +516,73 @@ class GCSApp:
         self.vehicle_dot.set_data([pkt.lon], [pkt.lat])
         self._autoscale_map()
 
+        self.traj3d_trail.set_data(lons, lats)
+        self.traj3d_trail.set_3d_properties(alts)
+        self.traj3d_dot.set_data([pkt.lon], [pkt.lat])
+        self.traj3d_dot.set_3d_properties([pkt.alt])
+        self._autoscale_traj3d()
+
         self._draw_quad(pkt.roll, pkt.pitch, pkt.yaw)
+        self._highlight_wplist(pkt.wp_index)
 
         speed = float(np.linalg.norm([pkt.vn, pkt.ve, pkt.vd]))
         status = ""
-        if self._status_msg and self._status_until_t is not None and pkt.t < self._status_until_t:
+        now = time.time()
+        if self._status_msg and self._status_until_wall is not None \
+                and now < self._status_until_wall:
             status = f"   [{self._status_msg}]"
-        elif self._status_until_t is not None and pkt.t >= self._status_until_t:
+        elif self._status_until_wall is not None and now >= self._status_until_wall:
             self._status_msg = ""
-            self._status_until_t = None
+            self._status_until_wall = None
         text = (
+            f"[{pkt.status.upper():7s}] "
             f"t={pkt.t:7.2f}s  "
             f"lat={pkt.lat:10.6f}  lon={pkt.lon:10.6f}  alt={pkt.alt:6.1f}m  "
             f"|v|={speed:5.2f}m/s  "
             f"roll={np.degrees(pkt.roll):+6.1f}  "
             f"pitch={np.degrees(pkt.pitch):+6.1f}  "
             f"yaw={np.degrees(pkt.yaw):+6.1f} deg  "
-            f"WP {pkt.wp_index}->({pkt.wp_lat:.5f},{pkt.wp_lon:.5f},{pkt.wp_alt:.1f})"
+            f"WP {pkt.wp_index}"
             f"{status}"
         )
         self.text_artist.set_text(text)
         return []
 
     # ----- Button callbacks -----
-    def _flash(self, msg: str, duration: float = 3.0):
+    def _flash(self, msg: str, duration: float = 4.0):
         self._status_msg = msg
-        with self.shared.lock:
-            t_now = self.shared.latest.t if self.shared.latest else 0.0
-        self._status_until_t = t_now + duration
+        self._status_until_wall = time.time() + duration
 
     def _clear_trail(self):
         with self.shared.lock:
             self.shared.trail_lat.clear()
             self.shared.trail_lon.clear()
+            self.shared.trail_alt.clear()
+
+    def _on_start(self, _event):
+        self.commands.start()
+        self._flash("Start sent")
+        print("[gcs] start command sent")
+
+    def _on_stop(self, _event):
+        self.commands.pause()
+        self._flash("Stop (pause) sent")
+        print("[gcs] pause command sent")
+
+    def _on_continue(self, _event):
+        self.commands.resume()
+        self._flash("Continue sent")
+        print("[gcs] resume command sent")
 
     def _on_reset(self, _event):
         self.commands.reset()
         self._clear_trail()
-        self._flash(f"Reset sent to {self.cmd_target[0]}:{self.cmd_target[1]}")
+        self._flash("Reset sent; press Start to fly")
         print("[gcs] reset command sent")
-
-    def _on_load(self, _event):
-        path = self._pick_file()
-        if not path:
-            return
-        try:
-            data = json.loads(Path(path).read_text())
-            wps = data.get("waypoints") or []
-            home = data.get("home")
-            if not wps:
-                raise ValueError("file has no 'waypoints'")
-        except Exception as e:
-            self._flash(f"Load failed: {e}")
-            print(f"[gcs] failed to load mission: {e}")
-            return
-
-        self.commands.load_mission(home, wps)
-        self.wp_lat = [w["lat"] for w in wps]
-        self.wp_lon = [w["lon"] for w in wps]
-        self._draw_planned_overlay()
-        self._clear_trail()
-        self._autoscale_map()
-        self._flash(f"Loaded {len(wps)} waypoints from {Path(path).name}")
-        print(f"[gcs] loaded mission '{path}' ({len(wps)} waypoints)")
 
     def _on_save_trajectory(self, _event):
         path = self._pick_save_path()
-        # Cancelled: empty path means "let the simulator pick a default"
+        # Cancelled dialog: empty path means "let the simulator pick a default"
         self.commands.save_trajectory(path)
         if path:
             self._flash(f"Save requested: {Path(path).name}")
@@ -396,24 +590,6 @@ class GCSApp:
         else:
             self._flash("Save requested (sim will pick default filename)")
             print("[gcs] save_trajectory sent (default path on sim host)")
-
-    def _pick_file(self) -> str | None:
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-        except ImportError:
-            print("[gcs] tkinter unavailable; cannot show file picker")
-            return None
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            path = filedialog.askopenfilename(
-                title="Select waypoints JSON",
-                filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-            )
-        finally:
-            root.destroy()
-        return path or None
 
     def _pick_save_path(self) -> str | None:
         try:
@@ -462,9 +638,12 @@ def main():
     ap.add_argument("--cmd-port", type=int, default=14551,
                     help="UDP destination port for commands")
     ap.add_argument("--waypoints", default="waypoints.json",
-                    help="Path to waypoints JSON (for plan overlay; optional)")
+                    help="Initially displayed mission (must match the sim's)")
+    ap.add_argument("--missions-dir", default=".",
+                    help="Directory scanned for selectable mission *.json files")
     args = ap.parse_args()
-    app = GCSApp(args.host, args.port, args.cmd_host, args.cmd_port, args.waypoints)
+    app = GCSApp(args.host, args.port, args.cmd_host, args.cmd_port,
+                 args.waypoints, missions_dir=args.missions_dir)
     app.run()
 
 
